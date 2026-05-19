@@ -3,6 +3,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createClient } from "@supabase/supabase-js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -22,8 +23,16 @@ const config = {
   ksherNotifyUrl: env("KSHER_NOTIFY_URL", ""),
   privateKeyPem: env("KSHER_PRIVATE_KEY_PEM", ""),
   privateKeyPath: env("KSHER_PRIVATE_KEY_PATH", "./privatekey.pem"),
-  verifyResponse: boolEnv("KSHER_VERIFY_RESPONSE", false)
+  verifyResponse: boolEnv("KSHER_VERIFY_RESPONSE", false),
+  supabaseUrl: env("SUPABASE_URL", ""),
+  supabaseServiceRoleKey: env("SUPABASE_SERVICE_ROLE_KEY", "")
 };
+
+const supabase = config.supabaseUrl && config.supabaseServiceRoleKey
+  ? createClient(config.supabaseUrl, config.supabaseServiceRoleKey, {
+      auth: { persistSession: false }
+    })
+  : null;
 
 const orders = new Map();
 
@@ -39,6 +48,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(config.port, () => {
   console.log(`ESP32 Ksher backend listening on http://0.0.0.0:${config.port}`);
   console.log(`Ksher mode: ${config.mock ? "mock" : "live"}`);
+  console.log(`Supabase storage: ${supabase ? "enabled" : "disabled"}`);
 });
 
 async function route(req, res) {
@@ -90,15 +100,43 @@ async function handleCreatePayment(req, res) {
   const orderNo = makeOrderNo(deviceId);
   const totalFee = amount * 100;
 
+  await saveTransaction({
+    orderNo,
+    deviceId,
+    amount,
+    totalFee,
+    currency: "THB",
+    status: "PENDING"
+  });
+  await logPaymentEvent(orderNo, "create_requested", "PENDING", "Payment creation requested", {
+    device_id: deviceId,
+    amount,
+    total_fee: totalFee
+  });
+
   let ksher;
-  if (config.mock) {
-    ksher = mockNativePay(orderNo, totalFee);
-  } else {
-    ksher = await createKsherNativePay({ orderNo, totalFee, deviceId });
+  try {
+    if (config.mock) {
+      ksher = mockNativePay(orderNo, totalFee);
+    } else {
+      ksher = await createKsherNativePay({ orderNo, totalFee, deviceId });
+    }
+  } catch (error) {
+    await updateTransaction(orderNo, {
+      status: "CREATE_FAILED",
+      raw_status: { error: error.message }
+    });
+    await logPaymentEvent(orderNo, "create_failed", "CREATE_FAILED", error.message, { error: error.message });
+    throw error;
   }
 
   const qrText = ksher.code_url || ksher.PaymentCode || "";
   if (!qrText) {
+    await updateTransaction(orderNo, {
+      status: "CREATE_FAILED",
+      raw_status: { error: "Ksher did not return QR text", raw_create: ksher }
+    });
+    await logPaymentEvent(orderNo, "create_failed", "CREATE_FAILED", "Ksher did not return QR text", ksher);
     sendJson(res, 502, { ok: false, error: "Ksher did not return QR text" });
     return;
   }
@@ -117,6 +155,14 @@ async function handleCreatePayment(req, res) {
   };
   orders.set(orderNo, order);
 
+  await updateTransaction(orderNo, {
+    ksher_order_no: order.ksherOrderNo,
+    qr_text: qrText,
+    raw_create: ksher,
+    status: "PENDING"
+  });
+  await logPaymentEvent(orderNo, "create_succeeded", "PENDING", "Payment QR created", ksher);
+
   sendJson(res, 200, {
     ok: true,
     order_no: orderNo,
@@ -129,7 +175,7 @@ async function handleCreatePayment(req, res) {
 async function handleCancelPayment(req, res) {
   const body = await readJson(req);
   const orderNo = String(body.order_no || "");
-  const order = orders.get(orderNo);
+  const order = await findOrder(orderNo);
 
   if (!order) {
     sendJson(res, 404, { ok: false, error: "Order not found" });
@@ -147,12 +193,21 @@ async function handleCancelPayment(req, res) {
 
   order.status = "CANCELLED";
   order.updatedAt = Date.now();
+  orders.set(orderNo, order);
+  await updateTransaction(orderNo, {
+    status: "CANCELLED",
+    cancelled_at: new Date().toISOString()
+  });
+  await logPaymentEvent(orderNo, "cancelled", "CANCELLED", "Payment cancelled by device", {
+    order_no: orderNo
+  });
+
   sendJson(res, 200, { ok: true, status: order.status, order_no: orderNo });
 }
 
 async function handlePaymentStatus(url, res) {
   const orderNo = String(url.searchParams.get("order_no") || "");
-  const order = orders.get(orderNo);
+  const order = await findOrder(orderNo);
 
   if (!order) {
     sendJson(res, 404, { ok: false, error: "Order not found" });
@@ -161,6 +216,9 @@ async function handlePaymentStatus(url, res) {
 
   if (config.mock) {
     if (order.status === "PENDING" && Date.now() - order.createdAt > 15000) order.status = "PAID";
+    order.updatedAt = Date.now();
+    orders.set(orderNo, order);
+    await updateTransactionForStatus(orderNo, order.status, { mock: true });
     sendJson(res, 200, { ok: true, status: order.status, order_no: orderNo });
     return;
   }
@@ -175,6 +233,9 @@ async function handlePaymentStatus(url, res) {
   order.status = status;
   order.rawStatus = ksher;
   order.updatedAt = Date.now();
+  orders.set(orderNo, order);
+  await updateTransactionForStatus(orderNo, status, ksher);
+  await logPaymentEvent(orderNo, "status_polled", status, "Payment status polled from Ksher", ksher);
 
   sendJson(res, 200, {
     ok: true,
@@ -196,11 +257,20 @@ async function handleKsherNotify(req, res) {
 
   const data = payload.data || payload;
   const orderNo = data.mch_order_no;
+  const status = mapKsherStatus(data.result);
+
+  await logPaymentEvent(orderNo || null, "webhook_received", status, "Ksher webhook received", payload);
+
   if (orderNo && orders.has(orderNo)) {
     const order = orders.get(orderNo);
-    order.status = mapKsherStatus(data.result);
+    order.status = status;
     order.rawNotify = payload;
     order.updatedAt = Date.now();
+    orders.set(orderNo, order);
+  }
+
+  if (orderNo) {
+    await updateTransactionForStatus(orderNo, status, payload, "raw_notify");
   }
 
   sendJson(res, 200, { result: "SUCCESS", msg: "OK" });
@@ -333,6 +403,117 @@ function readPrivateKey() {
 
   const keyPath = path.resolve(rootDir, config.privateKeyPath);
   return fs.readFileSync(keyPath, "utf8");
+}
+
+async function saveTransaction(order) {
+  if (!supabase) return;
+
+  const row = {
+    order_no: order.orderNo,
+    device_id: order.deviceId,
+    amount: order.amount,
+    total_fee: order.totalFee,
+    currency: order.currency || "THB",
+    status: order.status || "PENDING",
+    updated_at: new Date().toISOString()
+  };
+
+  const { error } = await supabase
+    .from("payment_transactions")
+    .upsert(row, { onConflict: "order_no" });
+
+  if (error) console.error("Supabase saveTransaction failed", error);
+}
+
+async function updateTransaction(orderNo, changes) {
+  if (!supabase || !orderNo) return;
+
+  const row = {
+    ...changes,
+    updated_at: new Date().toISOString()
+  };
+
+  const { error } = await supabase
+    .from("payment_transactions")
+    .update(row)
+    .eq("order_no", orderNo);
+
+  if (error) console.error("Supabase updateTransaction failed", error);
+}
+
+async function updateTransactionForStatus(orderNo, status, payload, rawColumn = "raw_status") {
+  const now = new Date().toISOString();
+  const changes = {
+    status,
+    ksher_result: payload?.data?.result || payload?.result || status,
+    [rawColumn]: payload
+  };
+
+  if (status === "PAID") changes.paid_at = now;
+  if (status === "CANCELLED" || status === "EXPIRED") changes.cancelled_at = now;
+
+  await updateTransaction(orderNo, changes);
+}
+
+async function getTransaction(orderNo) {
+  if (!supabase || !orderNo) return null;
+
+  const { data, error } = await supabase
+    .from("payment_transactions")
+    .select("*")
+    .eq("order_no", orderNo)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Supabase getTransaction failed", error);
+    return null;
+  }
+
+  return data;
+}
+
+async function findOrder(orderNo) {
+  if (!orderNo) return null;
+
+  const memoryOrder = orders.get(orderNo);
+  if (memoryOrder) return memoryOrder;
+
+  const transaction = await getTransaction(orderNo);
+  if (!transaction) return null;
+
+  const order = {
+    orderNo: transaction.order_no,
+    ksherOrderNo: transaction.ksher_order_no || "",
+    amount: transaction.amount,
+    totalFee: transaction.total_fee,
+    deviceId: transaction.device_id || "",
+    qrText: transaction.qr_text || "",
+    status: transaction.status,
+    rawCreate: transaction.raw_create,
+    rawStatus: transaction.raw_status,
+    rawNotify: transaction.raw_notify,
+    createdAt: transaction.created_at ? new Date(transaction.created_at).getTime() : Date.now(),
+    updatedAt: transaction.updated_at ? new Date(transaction.updated_at).getTime() : Date.now()
+  };
+
+  orders.set(orderNo, order);
+  return order;
+}
+
+async function logPaymentEvent(orderNo, eventType, status, message, payload) {
+  if (!supabase) return;
+
+  const { error } = await supabase
+    .from("payment_logs")
+    .insert({
+      order_no: orderNo,
+      event_type: eventType,
+      status,
+      message,
+      payload
+    });
+
+  if (error) console.error("Supabase logPaymentEvent failed", error);
 }
 
 function mockNativePay(orderNo, totalFee) {
