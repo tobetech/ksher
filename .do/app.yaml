@@ -3,8 +3,8 @@ region: sgp
 services:
   - name: api
     environment_slug: node-js
-    github:
-      repo: tobetech/ksher
+    git:
+      repo_clone_url: https://github.com/tobetech/ksher.git
       branch: main
       deploy_on_push: true
     run_command: npm start
