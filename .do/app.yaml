@@ -1,0 +1,34 @@
+name: ksher-backend
+region: sgp
+services:
+  - name: api
+    environment_slug: node-js
+    github:
+      repo: tobetech/ksher
+      branch: main
+      deploy_on_push: true
+    run_command: npm start
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    http_port: 8080
+    routes:
+      - path: /
+    envs:
+      - key: PORT
+        value: "8080"
+        scope: RUN_TIME
+      - key: KSHER_API_BASE
+        value: https://api.mch.ksher.net/KsherPay
+        scope: RUN_TIME
+      - key: KSHER_CHANNEL
+        value: promptpay
+        scope: RUN_TIME
+      - key: KSHER_FEE_TYPE
+        value: THB
+        scope: RUN_TIME
+      - key: KSHER_PRODUCT
+        value: ESP32 Kiosk
+        scope: RUN_TIME
+      - key: KSHER_VERSION
+        value: 3.0.0
+        scope: RUN_TIME
